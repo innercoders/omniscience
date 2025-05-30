@@ -30,6 +30,7 @@ import skadistats.clarity.wire.dota.common.proto.DOTAUserMessages.DOTA_COMBATLOG
 import skadistats.clarity.wire.dota.s2.proto.DOTAS2GcMessagesCommon.CMsgDOTAMatch;
 import skadistats.clarity.wire.shared.s1.proto.S1UserMessages.CUserMsg_SayText2;
 import skadistats.clarity.wire.shared.s2.proto.S2UserMessages.CUserMessageSayText2;
+import skadistats.clarity.event.Provides;
 
 import java.util.*;
 import java.io.IOException;
@@ -39,9 +40,6 @@ import java.io.OutputStream;
 import opendota.combatlogvisitors.TrackVisitor;
 import opendota.combatlogvisitors.GreevilsGreedVisitor;
 import opendota.combatlogvisitors.TrackVisitor.TrackStatus;
-import opendota.processors.warding.OnWardExpired;
-import opendota.processors.warding.OnWardKilled;
-import opendota.processors.warding.OnWardPlaced;
 
 public class Parse {
 
@@ -208,7 +206,17 @@ public class Parse {
         isPlayerStartingItemsWritten = new ArrayList<>(Arrays.asList(new Boolean[numPlayers]));
         Collections.fill(isPlayerStartingItemsWritten, Boolean.FALSE);
         long tStart = System.currentTimeMillis();
-        new SimpleRunner(new InputStreamSource(is)).runWith(this);
+        
+        try {
+            // We're going to completely eliminate the use of the warding processors
+            // and handle everything through standard entity processing instead
+            SimpleRunner runner = new SimpleRunner(new InputStreamSource(is));
+            runner.runWith(this);
+        } catch (Exception e) {
+            System.err.println("Error during initialization:");
+            e.printStackTrace();
+        }
+        
         long tMatch = System.currentTimeMillis() - tStart;
         System.err.format("total time taken: %s\n", (tMatch) / 1000.0);
     }
@@ -288,19 +296,20 @@ public class Parse {
 
     @OnMessage(CDOTAUserMsg_SpectatorPlayerUnitOrders.class)
     public void onSpectatorPlayerUnitOrders(Context ctx, CDOTAUserMsg_SpectatorPlayerUnitOrders message) {
-        Entry entry = new Entry(time);
-        entry.type = "actions";
-        // the entindex points to a CDOTAPlayer. This is probably the player that gave
-        // the order.
-        Entity e = ctx.getProcessor(Entities.class).getByIndex(message.getEntindex());
-        entry.slot = getPlayerSlotFromEntity(ctx, e);
-        // Integer handle = (Integer)getEntityProperty(e, "m_hAssignedHero", null);
-        // Entity h = ctx.getProcessor(Entities.class).getByHandle(handle);
-        // System.err.println(h.getDtClass().getDtName());
-        // break actions into types?
-        entry.key = String.valueOf(message.getOrderType());
-        // System.err.println(message);
-        output(entry);
+        return;
+        // Entry entry = new Entry(time);
+        // entry.type = "actions";
+        // // the entindex points to a CDOTAPlayer. This is probably the player that gave
+        // // the order.
+        // Entity e = ctx.getProcessor(Entities.class).getByIndex(message.getEntindex());
+        // entry.slot = getPlayerSlotFromEntity(ctx, e);
+        // // Integer handle = (Integer)getEntityProperty(e, "m_hAssignedHero", null);
+        // // Entity h = ctx.getProcessor(Entities.class).getByHandle(handle);
+        // // System.err.println(h.getDtClass().getDtName());
+        // // break actions into types?
+        // entry.key = String.valueOf(message.getOrderType());
+        // // System.err.println(message);
+        // output(entry);
     }
 
     @OnMessage(CDOTAUserMsg_LocationPing.class)
@@ -510,7 +519,20 @@ public class Parse {
                 // System.out.println(new Gson().toJson(entry));
                 output(entry);
             }
+        } else if (isWardEntity(entityName)) {
+            // Track ward entity creation
+            // Output ward placement info at creation time
+            Entry entry = buildWardEntry(ctx, e);
+            output(entry);
         }
+    }
+
+    // Add helper method to identify ward entities
+    private boolean isWardEntity(String dtName) {
+        return dtName.equals("CDOTA_NPC_Observer_Ward") || 
+               dtName.equals("DT_DOTA_NPC_Observer_Ward") ||
+               dtName.equals("CDOTA_NPC_Observer_Ward_TrueSight") ||
+               dtName.equals("DT_DOTA_NPC_Observer_Ward_TrueSight");
     }
 
     @OnMessage(CNETMsg_Tick.class)
@@ -991,19 +1013,6 @@ public class Parse {
         } catch (Exception ex) {
             return null;
         }
-    }
-
-    @OnWardKilled
-    public void onWardKilled(Context ctx, Entity e, String killerHeroName) {
-        Entry wardEntry = buildWardEntry(ctx, e);
-        wardEntry.attackername = killerHeroName;
-        output(wardEntry);
-    }
-
-    @OnWardExpired
-    @OnWardPlaced
-    public void onWardExistenceChanged(Context ctx, Entity e) {
-        output(buildWardEntry(ctx, e));
     }
 
     private Entry buildWardEntry(Context ctx, Entity e) {

@@ -3,17 +3,22 @@ function populate(e, container, meta) {
   let t;
   switch (e.type) {
     case 'interval':
+      t = container.players[e.slot];
+
+      if(!t.variant) {
+        t.variant = e.variant;
+      }
       break;
     case 'player_slot':
       container.players[e.key].player_slot = e.value;
       break;
-    case 'chat':
-    case 'chatwheel':
-      container.chat.push(JSON.parse(JSON.stringify(e)));
-      break;
-    case 'cosmetics':
-      container.cosmetics = JSON.parse(e.key);
-      break;
+    // case 'chat':
+    // case 'chatwheel':
+    //   container.chat.push(JSON.parse(JSON.stringify(e)));
+    //   break;
+    // case 'cosmetics':
+    //   container.cosmetics = JSON.parse(e.key);
+    //   break;
     case 'CHAT_MESSAGE_FIRSTBLOOD':
     case 'CHAT_MESSAGE_COURIER_LOST':
     case 'CHAT_MESSAGE_AEGIS':
@@ -24,11 +29,20 @@ function populate(e, container, meta) {
       container.objectives.push(JSON.parse(JSON.stringify(e)));
       break;
     case 'ability_levels':
-      meta.ability_levels[e.unit] = {
-        [e.key]: e.level,
-        ...meta.ability_levels[e.unit],
-      };
-      meta.ability_levels[e.unit][e.key] = e.level;
+      // save abilities to container.players[e.slot].abilities as array
+      if (!container.players[e.slot].abilities) {
+        container.players[e.slot].abilities = [];
+      }
+
+      if(e.level > 0 && e.time != -89) {
+        // container.players[e.slot].abilities.push({
+        //   [e.key]: e.level,
+        //   time: e.time,
+        // });
+        container.players[e.slot].abilities.push(
+          e.key
+        ) 
+      }
       break;
     default:
       if (!container.players[e.slot]) {
