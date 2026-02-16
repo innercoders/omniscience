@@ -15,6 +15,10 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -22,12 +26,34 @@ import com.sun.net.httpserver.HttpServer;
     
 public class Main {
 
+    private static final int DEFAULT_QUEUE_SIZE = 100;
+    private static final int DEFAULT_THREAD_IDLE_MS = 60000;
+    private static final int DEFAULT_PROCESS_TIMEOUT_MS = 1800000;
+    private static Semaphore requestLimiter;
+
     public static void main(String[] args) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(Integer.valueOf("5600")), 0);
         server.createContext("/", new MyHandler());
         server.createContext("/healthz", new HealthHandler());
         server.createContext("/blob", new BlobHandler());
-        server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+
+        int cores = Runtime.getRuntime().availableProcessors();
+        int maxThreads = parseEnvInt("PARSER_MAX_THREADS", Math.max(2, cores * 2));
+        int maxConcurrent = parseEnvInt("PARSER_MAX_CONCURRENT", maxThreads);
+        int queueSize = parseEnvInt("PARSER_QUEUE_SIZE", DEFAULT_QUEUE_SIZE);
+        int idleMs = parseEnvInt("PARSER_THREAD_IDLE_MS", DEFAULT_THREAD_IDLE_MS);
+
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(
+            maxThreads,
+            maxThreads,
+            idleMs,
+            TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(queueSize),
+            new ThreadPoolExecutor.AbortPolicy()
+        );
+        executor.allowCoreThreadTimeOut(true);
+        requestLimiter = new Semaphore(maxConcurrent);
+        server.setExecutor(executor);
         server.start();
 
         // Re-register ourselves
@@ -39,6 +65,9 @@ public class Main {
     static class MyHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
+            if (!tryAcquire(t)) {
+                return;
+            }
             t.sendResponseHeaders(200, 0);
             InputStream is = t.getRequestBody();
             OutputStream os = t.getResponseBody();
@@ -48,6 +77,9 @@ public class Main {
             catch (Exception e)
             {
             	e.printStackTrace();
+            }
+            finally {
+                release();
             }
             os.close();
         }
@@ -66,12 +98,25 @@ public class Main {
     static class BlobHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
+            if (!tryAcquire(t)) {
+                return;
+            }
             try {
                 Map<String, String> query = splitQuery(t.getRequestURI());
                 URL replayUrl = new URL(query.get("replay_url"));
-                String cmd = String.format("curl --max-time 150 --fail -L %s | %s | curl -X POST -T - localhost:5600 | node processors/createParsedDataBlob.mjs",
-                    replayUrl, 
-                    replayUrl.toString().endsWith(".bz2") ? "bunzip2" : "cat"
+                boolean isBz2 = replayUrl.toString().endsWith(".bz2");
+                int processTimeoutMs = parseEnvInt("PARSER_PROCESS_TIMEOUT_MS", DEFAULT_PROCESS_TIMEOUT_MS);
+                String cmd = String.format(
+                    "set -euo pipefail; " +
+                    "tmp=$(mktemp /tmp/replay.XXXXXX%s); " +
+                    "cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; " +
+                    "curl --fail --location --connect-timeout 20 --max-time 600 " +
+                    "--retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 900 " +
+                    "--speed-time 30 --speed-limit 1024 -o \"$tmp\" \"%s\"; " +
+                    "%s \"$tmp\" | curl -X POST -T - localhost:5600 | node processors/createParsedDataBlob.mjs",
+                    isBz2 ? ".dem.bz2" : ".dem",
+                    replayUrl,
+                    isBz2 ? "bunzip2 -c" : "cat"
                 );
                 System.err.println(cmd);
                 // Download, unzip, parse, aggregate
@@ -79,11 +124,29 @@ public class Main {
                 .start();
                 ByteArrayOutputStream output = new ByteArrayOutputStream();
                 ByteArrayOutputStream error = new ByteArrayOutputStream();
-                copy(proc.getInputStream(), output);
-                // Write error to console
-                copy(proc.getErrorStream(), error);
+                StreamGobbler outGobbler = new StreamGobbler(proc.getInputStream(), output);
+                StreamGobbler errGobbler = new StreamGobbler(proc.getErrorStream(), error);
+                Thread outThread = new Thread(outGobbler);
+                Thread errThread = new Thread(errGobbler);
+                outThread.start();
+                errThread.start();
+
+                boolean finished = proc.waitFor(processTimeoutMs, TimeUnit.MILLISECONDS);
+                if (!finished) {
+                    proc.destroyForcibly();
+                    t.sendResponseHeaders(504, 0);
+                    t.getResponseBody().close();
+                    return;
+                }
+                int exitCode = proc.exitValue();
+                try {
+                    outThread.join();
+                    errThread.join();
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+
                 System.err.println(error.toString());
-                int exitCode = proc.waitFor();
                 if (exitCode != 0) {
                     // We can send 200 status here and no response if expected error (read the error string)
                     // Maybe we can pass the specific error info in the response headers
@@ -116,6 +179,9 @@ public class Main {
             catch(InterruptedException e) {
                 e.printStackTrace();
             }
+            finally {
+                release();
+            }
         }
     }
 
@@ -145,6 +211,54 @@ public class Main {
             nread += n;
         }
         return nread;
+    }
+
+    private static int parseEnvInt(String name, int fallback) {
+        try {
+            String value = System.getenv(name);
+            if (value == null || value.trim().isEmpty()) return fallback;
+            return Integer.parseInt(value.trim());
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private static boolean tryAcquire(HttpExchange t) throws IOException {
+        if (requestLimiter == null) return true;
+        if (!requestLimiter.tryAcquire()) {
+            byte[] body = "busy".getBytes();
+            t.getResponseHeaders().add("Retry-After", "60");
+            t.sendResponseHeaders(429, body.length);
+            t.getResponseBody().write(body);
+            t.getResponseBody().close();
+            return false;
+        }
+        return true;
+    }
+
+    private static void release() {
+        if (requestLimiter != null) {
+            requestLimiter.release();
+        }
+    }
+
+    private static class StreamGobbler implements Runnable {
+        private final InputStream inputStream;
+        private final OutputStream outputStream;
+
+        StreamGobbler(InputStream inputStream, OutputStream outputStream) {
+            this.inputStream = inputStream;
+            this.outputStream = outputStream;
+        }
+
+        @Override
+        public void run() {
+            try {
+                copy(inputStream, outputStream);
+            } catch (IOException ignored) {
+                // Best effort; output is optional.
+            }
+        }
     }
 }
 
@@ -183,4 +297,3 @@ class RegisterTask extends TimerTask
         return stringBuilder.toString();
     }
 } 
-
