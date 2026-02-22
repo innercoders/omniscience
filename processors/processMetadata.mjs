@@ -5,6 +5,7 @@ function processMetadata(entries) {
   const heroToSlot = {};
   const slotToPlayerslot = {};
   const heroIdToSlot = {};
+  const facetByPlayerslot = {};
   const abilityLevels = {};
   const metaTypes = {
     interval(e) {
@@ -35,6 +36,18 @@ function processMetadata(entries) {
       // map slot number (0-9) to playerslot (0-4, 128-132)
       slotToPlayerslot[e.key] = e.value;
     },
+    match_player_facet(e) {
+      if (e.player_slot === undefined || e.player_slot === null) {
+        return;
+      }
+      if (!e.variant || e.variant <= 0) {
+        return;
+      }
+      // Keep first valid facet observed for a given playerslot.
+      if (!facetByPlayerslot[e.player_slot]) {
+        facetByPlayerslot[e.player_slot] = e.variant;
+      }
+    },
   };
   for (let i = 0; i < entries.length; i += 1) {
     const e = entries[i];
@@ -45,6 +58,7 @@ function processMetadata(entries) {
   return {
     hero_to_slot: heroToSlot,
     slot_to_playerslot: slotToPlayerslot,
+    facet_by_playerslot: facetByPlayerslot,
     hero_id_to_slot: heroIdToSlot,
     ability_levels: abilityLevels,
   };

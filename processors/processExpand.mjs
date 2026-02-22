@@ -39,7 +39,15 @@ function processExpand(entries, meta) {
     }
     // set slot and player_slot
     const slot = 'slot' in e ? e.slot : meta.hero_to_slot[e.unit];
-    output.push({ ...e, slot, player_slot: meta.slot_to_playerslot[slot] });
+    const playerSlot = meta.slot_to_playerslot[slot];
+    let normalized = e;
+    if (e.type === 'interval' && (!e.variant || e.variant <= 0) && playerSlot !== undefined) {
+      const facetFallback = meta.facet_by_playerslot?.[playerSlot];
+      if (facetFallback && facetFallback > 0) {
+        normalized = { ...e, variant: facetFallback };
+      }
+    }
+    output.push({ ...normalized, slot, player_slot: playerSlot });
   }
   // Tracks current aegis holder so we can ignore kills that pop aegis
   let aegisHolder = null;

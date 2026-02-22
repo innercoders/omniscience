@@ -273,8 +273,24 @@ public class Parse {
 
     @OnMessage(CMsgDOTAMatch.class)
     public void onDotaMatch(Context ctx, CMsgDOTAMatch message) {
-        // TODO could use this for match overview data for uploads
-        // System.err.println(message);
+        // Facet fallback: some replays no longer expose selected facet reliably via
+        // m_vecPlayerTeamData.m_nSelectedHeroVariant, but the GC match payload still
+        // carries selected_facet per player.
+        for (CMsgDOTAMatch.Player player : message.getPlayersList()) {
+            if (!player.hasPlayerSlot() || !player.hasSelectedFacet()) {
+                continue;
+            }
+            int selectedFacet = player.getSelectedFacet();
+            if (selectedFacet <= 0) {
+                continue;
+            }
+            Entry facetEntry = new Entry(time);
+            facetEntry.type = "match_player_facet";
+            facetEntry.player_slot = player.getPlayerSlot();
+            facetEntry.hero_id = player.hasHeroId() ? player.getHeroId() : null;
+            facetEntry.variant = selectedFacet;
+            output(facetEntry);
+        }
     }
 
     public Integer getPlayerSlotFromEntity(Context ctx, Entity e) {
