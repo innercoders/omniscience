@@ -29,7 +29,8 @@ public class Main {
     private static final int DEFAULT_QUEUE_SIZE = 100;
     private static final int DEFAULT_THREAD_IDLE_MS = 60000;
     private static final int DEFAULT_PROCESS_TIMEOUT_MS = 1800000;
-    private static Semaphore requestLimiter;
+    private static Semaphore parseLimiter;
+    private static Semaphore blobLimiter;
 
     public static void main(String[] args) throws Exception {
         HttpServer server = HttpServer.create(new InetSocketAddress(Integer.valueOf("5600")), 0);
@@ -40,6 +41,7 @@ public class Main {
         int cores = Runtime.getRuntime().availableProcessors();
         int maxThreads = parseEnvInt("PARSER_MAX_THREADS", Math.max(2, cores * 2));
         int maxConcurrent = parseEnvInt("PARSER_MAX_CONCURRENT", maxThreads);
+        int maxBlobConcurrent = parseEnvInt("PARSER_MAX_BLOB_CONCURRENT", Math.max(1, maxThreads / 2));
         int queueSize = parseEnvInt("PARSER_QUEUE_SIZE", DEFAULT_QUEUE_SIZE);
         int idleMs = parseEnvInt("PARSER_THREAD_IDLE_MS", DEFAULT_THREAD_IDLE_MS);
 
@@ -49,10 +51,11 @@ public class Main {
             idleMs,
             TimeUnit.MILLISECONDS,
             new ArrayBlockingQueue<>(queueSize),
-            new ThreadPoolExecutor.AbortPolicy()
+            new ThreadPoolExecutor.CallerRunsPolicy()
         );
         executor.allowCoreThreadTimeOut(true);
-        requestLimiter = new Semaphore(maxConcurrent);
+        parseLimiter = new Semaphore(Math.max(1, maxConcurrent));
+        blobLimiter = new Semaphore(Math.max(1, Math.min(maxBlobConcurrent, maxThreads)));
         server.setExecutor(executor);
         server.start();
 
@@ -65,23 +68,23 @@ public class Main {
     static class MyHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!tryAcquire(t)) {
-                return;
-            }
-            t.sendResponseHeaders(200, 0);
-            InputStream is = t.getRequestBody();
-            OutputStream os = t.getResponseBody();
+            if (!tryAcquire(t, parseLimiter, 15)) return;
             try {
-            	new Parse(is, os);
-            }
-            catch (Exception e)
-            {
-            	e.printStackTrace();
+                t.sendResponseHeaders(200, 0);
+                InputStream is = t.getRequestBody();
+                OutputStream os = t.getResponseBody();
+                try {
+                    new Parse(is, os);
+                }
+                catch (Exception e)
+                {
+                    e.printStackTrace();
+                }
+                os.close();
             }
             finally {
-                release();
+                release(parseLimiter);
             }
-            os.close();
         }
     }
 
@@ -98,89 +101,88 @@ public class Main {
     static class BlobHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
-            if (!tryAcquire(t)) {
-                return;
-            }
+            if (!tryAcquire(t, blobLimiter, 30)) return;
             try {
-                Map<String, String> query = splitQuery(t.getRequestURI());
-                URL replayUrl = new URL(query.get("replay_url"));
-                boolean isBz2 = replayUrl.toString().endsWith(".bz2");
-                int processTimeoutMs = parseEnvInt("PARSER_PROCESS_TIMEOUT_MS", DEFAULT_PROCESS_TIMEOUT_MS);
-                String cmd = String.format(
-                    "set -euo pipefail; " +
-                    "tmp=$(mktemp /tmp/replay.XXXXXX%s); " +
-                    "cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; " +
-                    "curl --fail --location --connect-timeout 20 --max-time 600 " +
-                    "--retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 900 " +
-                    "--speed-time 30 --speed-limit 1024 -o \"$tmp\" \"%s\"; " +
-                    "%s \"$tmp\" | curl -X POST -T - localhost:5600 | node processors/createParsedDataBlob.mjs",
-                    isBz2 ? ".dem.bz2" : ".dem",
-                    replayUrl,
-                    isBz2 ? "bunzip2 -c" : "cat"
-                );
-                System.err.println(cmd);
-                // Download, unzip, parse, aggregate
-                Process proc = new ProcessBuilder(new String[] {"bash", "-c", cmd})
-                .start();
-                ByteArrayOutputStream output = new ByteArrayOutputStream();
-                ByteArrayOutputStream error = new ByteArrayOutputStream();
-                StreamGobbler outGobbler = new StreamGobbler(proc.getInputStream(), output);
-                StreamGobbler errGobbler = new StreamGobbler(proc.getErrorStream(), error);
-                Thread outThread = new Thread(outGobbler);
-                Thread errThread = new Thread(errGobbler);
-                outThread.start();
-                errThread.start();
-
-                boolean finished = proc.waitFor(processTimeoutMs, TimeUnit.MILLISECONDS);
-                if (!finished) {
-                    proc.destroyForcibly();
-                    t.sendResponseHeaders(504, 0);
-                    t.getResponseBody().close();
-                    return;
-                }
-                int exitCode = proc.exitValue();
                 try {
-                    outThread.join();
-                    errThread.join();
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                }
+                    Map<String, String> query = splitQuery(t.getRequestURI());
+                    URL replayUrl = new URL(query.get("replay_url"));
+                    boolean isBz2 = replayUrl.toString().endsWith(".bz2");
+                    int processTimeoutMs = parseEnvInt("PARSER_PROCESS_TIMEOUT_MS", DEFAULT_PROCESS_TIMEOUT_MS);
+                    String cmd = String.format(
+                        "set -euo pipefail; " +
+                        "tmp=$(mktemp /tmp/replay.XXXXXX%s); " +
+                        "cleanup(){ rm -f \"$tmp\"; }; trap cleanup EXIT; " +
+                        "curl --fail --location --connect-timeout 20 --max-time 600 " +
+                        "--retry 5 --retry-all-errors --retry-delay 5 --retry-max-time 900 " +
+                        "--speed-time 30 --speed-limit 1024 -o \"$tmp\" \"%s\"; " +
+                        "%s \"$tmp\" | curl -X POST -T - localhost:5600 | node processors/createParsedDataBlob.mjs",
+                        isBz2 ? ".dem.bz2" : ".dem",
+                        replayUrl,
+                        isBz2 ? "bunzip2 -c" : "cat"
+                    );
+                    System.err.println(cmd);
+                    // Download, unzip, parse, aggregate
+                    Process proc = new ProcessBuilder(new String[] {"bash", "-c", cmd})
+                    .start();
+                    ByteArrayOutputStream output = new ByteArrayOutputStream();
+                    ByteArrayOutputStream error = new ByteArrayOutputStream();
+                    StreamGobbler outGobbler = new StreamGobbler(proc.getInputStream(), output);
+                    StreamGobbler errGobbler = new StreamGobbler(proc.getErrorStream(), error);
+                    Thread outThread = new Thread(outGobbler);
+                    Thread errThread = new Thread(errGobbler);
+                    outThread.start();
+                    errThread.start();
 
-                System.err.println(error.toString());
-                if (exitCode != 0) {
-                    // We can send 200 status here and no response if expected error (read the error string)
-                    // Maybe we can pass the specific error info in the response headers
-                    int status = 500;
-                    if (error.toString().contains("curl: (28) Operation timed out")) {
-                        // Parse took too long, maybe China replay?
-                        status = 200;
+                    boolean finished = proc.waitFor(processTimeoutMs, TimeUnit.MILLISECONDS);
+                    if (!finished) {
+                        proc.destroyForcibly();
+                        t.sendResponseHeaders(504, 0);
+                        t.getResponseBody().close();
+                        return;
                     }
-                    if (error.toString().contains("curl: (22) The requested URL returned error: 502")) {
-                        // Google-Edge-Cache: origin retries exhausted Error: 2010
-                        // Server error, don't retry
-                        status = 200;
+                    int exitCode = proc.exitValue();
+                    try {
+                        outThread.join();
+                        errThread.join();
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
                     }
-                    if (error.toString().contains("bunzip2: Data integrity error when decompressing")) {
-                        // Corrupted replay, don't retry
-                        status = 200;
+
+                    System.err.println(error.toString());
+                    if (exitCode != 0) {
+                        // We can send 200 status here and no response if expected error (read the error string)
+                        // Maybe we can pass the specific error info in the response headers
+                        int status = 500;
+                        if (error.toString().contains("curl: (28) Operation timed out")) {
+                            // Parse took too long, maybe China replay?
+                            status = 200;
+                        }
+                        if (error.toString().contains("curl: (22) The requested URL returned error: 502")) {
+                            // Google-Edge-Cache: origin retries exhausted Error: 2010
+                            // Server error, don't retry
+                            status = 200;
+                        }
+                        if (error.toString().contains("bunzip2: Data integrity error when decompressing")) {
+                            // Corrupted replay, don't retry
+                            status = 200;
+                        }
+                        if (error.toString().contains("bunzip2: (stdin) is not a bzip2 file.")) {
+                            // Tried to unzip a non-bz2 file
+                            status = 200;
+                        }
+                        t.sendResponseHeaders(status, 0);
+                        t.getResponseBody().close();
+                    } else {
+                        t.sendResponseHeaders(200, output.size());
+                        output.writeTo(t.getResponseBody());
+                        t.getResponseBody().close();
                     }
-                    if (error.toString().contains("bunzip2: (stdin) is not a bzip2 file.")) {
-                        // Tried to unzip a non-bz2 file
-                        status = 200;
-                    }
-                    t.sendResponseHeaders(status, 0);
-                    t.getResponseBody().close();
-                } else {
-                    t.sendResponseHeaders(200, output.size());
-                    output.writeTo(t.getResponseBody());
-                    t.getResponseBody().close();
                 }
-            } 
-            catch(InterruptedException e) {
-                e.printStackTrace();
-            }
-            finally {
-                release();
+                catch(InterruptedException e) {
+                    e.printStackTrace();
+                }
+            } finally {
+                release(blobLimiter);
             }
         }
     }
@@ -223,11 +225,11 @@ public class Main {
         }
     }
 
-    private static boolean tryAcquire(HttpExchange t) throws IOException {
-        if (requestLimiter == null) return true;
-        if (!requestLimiter.tryAcquire()) {
+    private static boolean tryAcquire(HttpExchange t, Semaphore limiter, int retryAfterSeconds) throws IOException {
+        if (limiter == null) return true;
+        if (!limiter.tryAcquire()) {
             byte[] body = "busy".getBytes();
-            t.getResponseHeaders().add("Retry-After", "60");
+            t.getResponseHeaders().add("Retry-After", String.valueOf(retryAfterSeconds));
             t.sendResponseHeaders(429, body.length);
             t.getResponseBody().write(body);
             t.getResponseBody().close();
@@ -236,9 +238,9 @@ public class Main {
         return true;
     }
 
-    private static void release() {
-        if (requestLimiter != null) {
-            requestLimiter.release();
+    private static void release(Semaphore limiter) {
+        if (limiter != null) {
+            limiter.release();
         }
     }
 
